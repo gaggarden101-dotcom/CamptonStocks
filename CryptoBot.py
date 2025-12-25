@@ -1,16 +1,18 @@
 import discord
 from discord.ext import commands, tasks
-from discord import app_commands
+from discord import app_commands, ui
 import random
 import json
 import os
 import math
+import asyncio
 
 # --- Configuration ---
-TOKEN = 'MTQ1MzE4NTczNzU1NzI3ODc3Mw.G2ijrK.haZO5odUnY61ARM4z3bftcJeOZiQMhDeAv8GXM' # Your actual bot token
+# Your bot token will be read from Replit Secrets (environment variable)
+TOKEN = os.environ.get('DISCORD_BOT_TOKEN') 
 PREFIX = '!' # While not used for slash commands, kept for potential future prefix commands
 
-# List of your cryptocurrencies - now only Campton Coin
+# List of your cryptocurrencies - currently only Campton Coin
 CRYPTO_NAMES = ["Campton Coin"]
 
 # File to store market and user data
@@ -21,10 +23,21 @@ MIN_PRICE = 50.00
 MAX_PRICE = 230.00
 INITIAL_PRICE = 120.00 # Starting price for Campton Coin
 
+# --- Volatility Levels ---
+# The market will randomly pick one of these max percentages for each update cycle
+VOLATILITY_LEVELS = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80] # +/-10% to +/-80%
+
 # --- Discord Channel IDs ---
-ANNOUNCEMENT_CHANNEL_ID = 1453194843009585326 # YOUR CHANNEL ID for market updates
+# Replace these with your actual channel/category IDs
+ANNOUNCEMENT_CHANNEL_ID = 1453194843009585326 # Your #market-updates channel ID
 TICKET_CATEGORY_ID = 1453203314689708072 # Your Tickets Category ID
-HELP_DESK_CHANNEL_ID = 1453208931034726410 # YOUR #help-desk channel ID
+HELP_DESK_CHANNEL_ID = 1453208931034726410 # Your #help-desk channel ID
+VERIFY_CHANNEL_ID = 1453236019427283035 # Your #verify channel ID
+
+# --- Role IDs ---
+# Replace these with your actual role IDs
+NEW_ARRIVAL_ROLE_ID = 1453229600594333869 # Role ID for New Arrival
+CAMPTON_CITIZEN_ROLE_ID = 1453229088507428874 # Role ID for Campton Citizen
 
 # --- Data Storage (Simple JSON file for persistence) ---
 def load_data():
@@ -33,15 +46,18 @@ def load_data():
         with open(DATA_FILE, 'r') as f:
             try:
                 loaded_data = json.load(f)
-                # Safely update default structure with loaded data
                 data.update(loaded_data)
                 # Ensure all top-level keys exist if they were missing in an older file
                 if "coins" not in data:
                     data["coins"] = {}
                 if "users" not in data:
                     data["users"] = {}
-                if "tickets" not in data: # <--- THIS IS THE KEY FIX
+                if "tickets" not in data:
                     data["tickets"] = {}
+                # Ensure each user has a 'verification' sub-dictionary
+                for user_id in data["users"]:
+                    if "verification" not in data["users"][user_id]:
+                        data["users"][user_id]["verification"] = {}
             except json.JSONDecodeError:
                 print(f"Warning: {DATA_FILE} is corrupted or empty. Starting with fresh data.")
     return data
@@ -53,10 +69,11 @@ def save_data(data):
 # --- Bot Initialization ---
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True
+intents.members = True # Essential for on_member_join event, role management, and member fetching
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
-bot.owner_id = 357681843790675978 # Your Discord User ID
+# Your Discord User ID (Bot Owner)
+bot.owner_id = 357681843790675978 
 
 # Global data store
 market_data = load_data()
@@ -67,7 +84,7 @@ if "Campton Coin" not in market_data["coins"] or len(market_data["coins"]) != le
     for name in CRYPTO_NAMES:
         market_data["coins"][name] = {"price": INITIAL_PRICE}
     save_data(market_data)
-# --- Ensure loaded price is within bounds ---
+# Ensure loaded price is within bounds
 elif market_data["coins"]["Campton Coin"]["price"] < MIN_PRICE or market_data["coins"]["Campton Coin"]["price"] > MAX_PRICE:
     print(f"Detected Campton Coin price outside bounds ({market_data['coins']['Campton Coin']['price']:.2f}). Resetting to INITIAL_PRICE.")
     market_data["coins"]["Campton Coin"]["price"] = INITIAL_PRICE
@@ -91,16 +108,22 @@ def update_prices():
     """Simulates price fluctuations for all coins, keeping them within a range."""
     for coin_name in market_data["coins"]:
         current_price = market_data["coins"][coin_name]["price"]
-        change_percent = random.uniform(-0.10, 0.10)
+        
+        # Randomly select a volatility level from the expanded list
+        chosen_volatility = random.choice(VOLATILITY_LEVELS)
+        change_percent = random.uniform(-chosen_volatility, chosen_volatility)
+        
         new_price = current_price * (1 + change_percent)
-        new_price = max(MIN_PRICE, min(MAX_PRICE, new_price))
+        new_price = max(MIN_PRICE, min(MAX_PRICE, new_price)) # Clamp price within min/max range
         market_data["coins"][coin_name]["price"] = round(new_price, 2)
     save_data(market_data)
 
 def get_user_data(user_id):
-    """Retrieves or initializes a user's portfolio."""
+    """Retrieves or initializes a user's portfolio and verification data."""
     if str(user_id) not in market_data["users"]:
-        market_data["users"][str(user_id)] = {"balance": 0.0, "portfolio": {}}
+        market_data["users"][str(user_id)] = {"balance": 0.0, "portfolio": {}, "verification": {}}
+    elif "verification" not in market_data["users"][str(user_id)]:
+        market_data["users"][str(user_id)]["verification"] = {}
     return market_data["users"][str(user_id)]
 
 def buy_coin(user_id, coin_name, quantity):
@@ -133,13 +156,13 @@ def sell_coin(user_id, coin_name, quantity):
 
     user["balance"] += revenue
     user["portfolio"][coin_name] -= quantity
-    if user["portfolio"][coin_name] <= 0.0001:
+    if user["portfolio"][coin_name] <= 0.0001: # Use a small epsilon for float comparison to zero
         del user["portfolio"][coin_name]
     save_data(market_data)
     return f"Successfully sold {quantity} {coin_name}(s) for {revenue:.2f} dollars."
 
 # --- Scheduled Task ---
-@tasks.loop(hours=72)
+@tasks.loop(hours=72) # Runs every 72 hours (3 days)
 async def scheduled_price_update():
     print("Running scheduled price update...")
     update_prices()
@@ -175,7 +198,6 @@ class OpenTicketButton(discord.ui.Button):
             await interaction.followup.send("Ticket system is not fully configured. Please contact the bot owner.", ephemeral=True)
             return
 
-        # Check if user already has an open ticket
         for ticket_id, ticket_info in market_data["tickets"].items():
             if ticket_info["user_id"] == interaction.user.id and ticket_info["status"] == "open":
                 existing_channel = bot.get_channel(int(ticket_id))
@@ -188,7 +210,6 @@ class OpenTicketButton(discord.ui.Button):
             await interaction.followup.send("The ticket category could not be found or is misconfigured. Please contact the bot owner.", ephemeral=True)
             return
 
-        # Permissions for the new ticket channel
         overwrites = {
             interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
             interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
@@ -236,8 +257,107 @@ class OpenTicketButton(discord.ui.Button):
 
 class TicketView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=None)
+        super().__init__(timeout=None) # Timeout=None for persistent view
         self.add_item(OpenTicketButton())
+
+# --- Verification System Classes ---
+class VerificationModal(ui.Modal, title='Project New Campton Verification'):
+    roblox_username = ui.TextInput(label='Your Roblox Username', placeholder='e.g., RobloxPlayer123', style=discord.TextStyle.short)
+    pnc_full_name = ui.TextInput(label='Project New Campton Full Name (First Last)', placeholder='e.g., John Doe', style=discord.TextStyle.short)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True) # Acknowledge modal submission immediately
+
+        member = interaction.user
+        guild = interaction.guild
+
+        if not guild:
+            await interaction.followup.send("This verification can only be completed in a server.", ephemeral=True)
+            return
+
+        new_arrival_role = guild.get_role(NEW_ARRIVAL_ROLE_ID)
+        campton_citizen_role = guild.get_role(CAMPTON_CITIZEN_ROLE_ID)
+
+        if not new_arrival_role or not campton_citizen_role:
+            await interaction.followup.send("Verification roles are not correctly configured. Please contact server staff.", ephemeral=True)
+            print(f"ERROR: Verification roles not found. New Arrival ID: {NEW_ARRIVAL_ROLE_ID}, Citizen ID: {CAMPTON_CITIZEN_ROLE_ID}")
+            return
+
+        if campton_citizen_role in member.roles:
+            await interaction.followup.send("You are already a Campton Citizen!", ephemeral=True)
+            return
+
+        # Store verification data
+        user_data = get_user_data(member.id) # Ensure user_data has 'verification' key
+        user_data["verification"]["roblox_username"] = str(self.roblox_username)
+        user_data["verification"]["pnc_full_name"] = str(self.pnc_full_name)
+        user_data["verification"]["verified_at"] = discord.utils.utcnow().isoformat()
+        save_data(market_data)
+
+        # Perform role changes
+        try:
+            if new_arrival_role in member.roles:
+                await member.remove_roles(new_arrival_role)
+            await member.add_roles(campton_citizen_role)
+            print(f"{member.display_name} ({member.id}) successfully verified. Roblox: {self.roblox_username}, PNC Name: {self.pnc_full_name}")
+            
+            # Attempt to change nickname
+            try:
+                await member.edit(nick=str(self.pnc_full_name))
+                await interaction.followup.send(f"🎉 You have successfully verified and are now a Campton Citizen! Your server nickname has been updated to '{self.pnc_full_name}'. Welcome!", ephemeral=True)
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    f"🎉 You have successfully verified and are now a Campton Citizen! Welcome! "
+                    f"I couldn't change your nickname to '{self.pnc_full_name}'. Please ensure my role is higher than yours and I have 'Manage Nicknames' permission.",
+                    ephemeral=True
+                )
+                print(f"WARNING: Bot lacks 'Manage Nicknames' permission to set nickname for {member.display_name} to '{self.pnc_full_name}'.")
+            
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "I do not have permission to manage roles. Please ensure my role is higher than 'New Arrival' and 'Campton Citizen' and I have 'Manage Roles' permission.",
+                ephemeral=True
+            )
+            print(f"ERROR: Bot lacks 'Manage Roles' permission to verify {member.display_name}.")
+        except Exception as e:
+            await interaction.followup.send(f"An unexpected error occurred during verification: {e}", ephemeral=True)
+            print(f"ERROR during verification for {member.display_name}: {e}")
+
+class VerifyButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Verify and Get Citizen Role", style=discord.ButtonStyle.primary, custom_id="verify_button")
+
+    async def callback(self, interaction: discord.Interaction):
+        member = interaction.user
+        guild = interaction.guild
+
+        if not guild:
+            await interaction.response.send_message("This verification can only be completed in a server.", ephemeral=True)
+            return
+        
+        new_arrival_role = guild.get_role(NEW_ARRIVAL_ROLE_ID)
+        campton_citizen_role = guild.get_role(CAMPTON_CITIZEN_ROLE_ID)
+
+        if not new_arrival_role or not campton_citizen_role:
+            await interaction.response.send_message("Verification roles are not correctly configured. Please contact server staff.", ephemeral=True)
+            return
+
+        if campton_citizen_role in member.roles:
+            await interaction.response.send_message("You are already a Campton Citizen!", ephemeral=True)
+            return
+        
+        if new_arrival_role not in member.roles:
+             await interaction.response.send_message("You don't have the 'New Arrival' role. If you believe this is an error, please contact staff.", ephemeral=True)
+             return
+
+        await interaction.response.send_modal(VerificationModal())
+
+
+class VerifyView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None) # Timeout=None for persistent view
+        self.add_item(VerifyButton())
+
 
 # --- Discord Bot Events and Slash Commands ---
 
@@ -245,10 +365,41 @@ class TicketView(discord.ui.View):
 async def on_ready():
     print(f'{bot.user.name} has connected to Discord!')
     bot.add_view(TicketView())
+    bot.add_view(VerifyView())
     await bot.tree.sync()
     print("Slash commands synced!")
     scheduled_price_update.start()
     print("Scheduled price update task started.")
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    print(f"Member joined: {member.display_name} ({member.id})")
+    if NEW_ARRIVAL_ROLE_ID:
+        role = member.guild.get_role(NEW_ARRIVAL_ROLE_ID)
+        if role:
+            try:
+                await member.add_roles(role)
+                print(f"Assigned 'New Arrival' role to {member.display_name}.")
+                try:
+                    await member.send(
+                        f"Welcome to the Campton Coins server, {member.display_name}!\n\n"
+                        f"Please head to the verification channel (<#{VERIFY_CHANNEL_ID}>) to verify your account and get full access.\n"
+                        f"Click the 'Verify' button there and enter your Roblox Username and Project New Campton Full Name."
+                    )
+                    print(f"Sent verification DM to {member.display_name}.")
+                except discord.Forbidden:
+                    print(f"WARNING: Could not send verification DM to {member.display_name}. DMs might be disabled.")
+
+            except discord.Forbidden:
+                print(f"ERROR: Bot lacks permissions to assign 'New Arrival' role to {member.display_name}. "
+                      f"Ensure bot's role is higher than 'New Arrival' role and has 'Manage Roles' permission.")
+            except Exception as e:
+                print(f"An unexpected error occurred while assigning 'New Arrival' role to {member.display_name}: {e}")
+        else:
+            print(f"Warning: 'New Arrival' role with ID {NEW_ARRIVAL_ROLE_ID} not found in guild {member.guild.name}.")
+    else:
+        print("Warning: NEW_ARRIVAL_ROLE_ID is not configured, skipping role assignment for new member.")
+
 
 @bot.tree.command(name='prices', description='Displays the current price of Campton Coin.')
 @app_commands.check(is_bot_owner_slash)
@@ -387,7 +538,7 @@ async def withdraw(interaction: discord.Interaction, amount: float):
         await interaction.followup.send("Could not find the bot owner to send the withdrawal request. Please ensure the bot owner is correctly configured.", ephemeral=True)
 
 @bot.tree.command(name='approvewithdrawal', description='Approves a user\'s withdrawal request and deducts funds. (Bot Owner Only)')
-@app_commands.describe(user_id='The ID of the user whose withdrawal to approve.', amount='The amount to deduct.')
+@app_commands.describe(user_id='The ID of the user whose withdrawal to approve.', amount='The Amount to deduct.')
 async def approve_withdrawal(interaction: discord.Interaction, user_id: str, amount: float):
     """Approves a user's withdrawal request and deducts funds. (Bot Owner Only)"""
     await interaction.response.defer(ephemeral=True)
@@ -507,7 +658,6 @@ async def transfer(interaction: discord.Interaction, recipient: discord.Member, 
     else:
         await interaction.followup.send(feedback_message, ephemeral=True)
 
-# --- NEW: Owner-only command to send the ticket button ---
 @bot.tree.command(name='sendticketbutton', description='(Owner Only) Sends the "Open Ticket" button to the current channel.')
 @app_commands.check(is_bot_owner_slash)
 async def send_ticket_button(interaction: discord.Interaction):
@@ -521,7 +671,6 @@ async def send_ticket_button(interaction: discord.Interaction):
         description="Click the button below to open a private support ticket with the staff. Please describe your issue clearly once the ticket channel is created.",
         color=discord.Color.blue()
     )
-    # Send the message with the persistent view
     await interaction.channel.send(embed=embed, view=TicketView())
     await interaction.followup.send("The 'Open Ticket' button has been sent to this channel.", ephemeral=True)
 
@@ -535,7 +684,33 @@ async def send_ticket_button_error(interaction: discord.Interaction, error: app_
         else:
             await interaction.response.send_message(f"An unexpected error occurred: {error}", ephemeral=True)
 
-# --- Ticket Close Command (remains a slash command) ---
+@bot.tree.command(name='sendverifybutton', description='(Owner Only) Sends the "Verify" button to the current channel.')
+@app_commands.check(is_bot_owner_slash)
+async def send_verify_button(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    if interaction.channel.id != VERIFY_CHANNEL_ID:
+        await interaction.followup.send(f"This command should ideally be used in the designated verify channel (<#{VERIFY_CHANNEL_ID}>).", ephemeral=True)
+
+    embed = discord.Embed(
+        title="Welcome, New Arrival! Please Verify.",
+        description="Click the button below to verify your account and gain full access to the server as a Campton Citizen!\n\n**You will be asked for your Roblox Username and Project New Campton Full Name.**",
+        color=discord.Color.purple()
+    )
+    await interaction.channel.send(embed=embed, view=VerifyView())
+    await interaction.followup.send("The 'Verify' button has been sent to this channel.", ephemeral=True)
+
+@send_verify_button.error
+async def send_verify_button_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("You must be the bot owner to use this command.", ephemeral=True)
+    else:
+        if interaction.response.is_done():
+            await interaction.followup.send(f"An unexpected error occurred: {error}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"An unexpected error occurred: {error}", ephemeral=True)
+
+
 @bot.tree.command(name='close', description='Close the current support ticket. (Can only be used in a ticket channel)')
 async def close(interaction: discord.Interaction):
     """Close the current support ticket."""
@@ -545,25 +720,23 @@ async def close(interaction: discord.Interaction):
         await interaction.followup.send("Ticket system is not fully configured. Please contact the bot owner.", ephemeral=True)
         return
 
-    # Check if the command is used in a ticket channel
     if str(interaction.channel.id) not in market_data["tickets"]:
         await interaction.followup.send("This command can only be used in a ticket channel.", ephemeral=True)
         return
 
     ticket_info = market_data["tickets"][str(interaction.channel.id)]
     
-    # Check if user is the ticket creator or bot owner
     if interaction.user.id != ticket_info["user_id"] and interaction.user.id != bot.owner_id:
         await interaction.followup.send("You must be the ticket creator or bot owner to close this ticket.", ephemeral=True)
         return
 
-    # Confirm closure
-    confirm_view = discord.ui.View()
+    confirm_view = discord.ui.View(timeout=300)
     confirm_button = discord.ui.Button(label="Confirm Close", style=discord.ButtonStyle.red)
 
     async def confirm_callback(button_interaction: discord.Interaction):
-        await button_interaction.response.defer()
-        if button_interaction.user.id != interaction.user.id:
+        await button_interaction.response.defer(ephemeral=True)
+
+        if button_interaction.user.id != interaction.user.id and button_interaction.user.id != bot.owner_id:
             await button_interaction.followup.send("Only the person who initiated the close can confirm.", ephemeral=True)
             return
 
@@ -572,15 +745,150 @@ async def close(interaction: discord.Interaction):
         save_data(market_data)
 
         await interaction.channel.send("Ticket closed. This channel will be deleted shortly.")
-        await button_interaction.message.delete()
-        await discord.utils.sleep(5)
-        await interaction.channel.delete()
+        
+        await asyncio.sleep(5)
+        
+        try:
+            await interaction.channel.delete()
+        except discord.Forbidden:
+            await button_interaction.followup.send(
+                "I do not have permission to delete channels. Please ensure I have 'Manage Channels' permission in this category.",
+                ephemeral=True
+            )
+            print(f"ERROR: Bot lacks 'Manage Channels' permission to delete ticket {interaction.channel.name} ({interaction.channel.id}).")
+        except Exception as e:
+            await button_interaction.followup.send(f"An unexpected error occurred while deleting the channel: {e}", ephemeral=True)
+            print(f"ERROR deleting ticket channel {interaction.channel.name} ({interaction.channel.id}): {e}")
+
 
     confirm_button.callback = confirm_callback
     confirm_view.add_item(confirm_button)
 
     await interaction.followup.send("Are you sure you want to close this ticket?", view=confirm_view, ephemeral=True)
 
+# --- Clear Messages Command ---
+@bot.tree.command(name='clearmessages', description='(Owner Only) Clears a specified number of messages from the current channel.')
+@app_commands.describe(amount='The number of messages to clear (1-100).')
+@app_commands.check(is_bot_owner_slash)
+async def clearmessages(interaction: discord.Interaction, amount: int):
+    """Clears a specified number of messages from the current channel."""
+    await interaction.response.defer(ephemeral=True)
 
-# Run the bot
+    if not (1 <= amount <= 100):
+        await interaction.followup.send("You can only clear between 1 and 100 messages.", ephemeral=True)
+        return
+
+    try:
+        deleted = await interaction.channel.purge(limit=amount)
+        await interaction.followup.send(f"Successfully cleared {len(deleted)} messages.", ephemeral=True)
+        print(f"Cleared {len(deleted)} messages in #{interaction.channel.name} by {interaction.user.display_name}.")
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I do not have permission to manage messages in this channel. Please ensure I have 'Manage Messages' permission.",
+            ephemeral=True
+        )
+        print(f"ERROR: Bot lacks 'Manage Messages' permission in #{interaction.channel.name} for clearmessages.")
+    except Exception as e:
+        await interaction.followup.send(f"An unexpected error occurred: {e}", ephemeral=True)
+        print(f"ERROR clearing messages in #{interaction.channel.name}: {e}")
+
+@clearmessages.error
+async def clearmessages_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("You must be the bot owner to use this command.", ephemeral=True)
+    elif isinstance(error, app_commands.MissingRequiredArgument):
+        await interaction.response.send_message("Missing arguments. Usage: `/clearmessages <amount>`", ephemeral=True)
+    elif isinstance(error, app_commands.BadArgument):
+        await interaction.response.send_message("Invalid amount. Please provide a number.", ephemeral=True)
+    else:
+        if interaction.response.is_done():
+            await interaction.followup.send(f"An unexpected error occurred: {error}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"An unexpected error occurred: {error}", ephemeral=True)
+
+# --- Lockdown Command ---
+@bot.tree.command(name='lockdown', description='(Owner Only) Locks down the current channel or a specified channel.')
+@app_commands.describe(channel='The channel to lock down (defaults to current channel).')
+@app_commands.check(is_bot_owner_slash)
+async def lockdown(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    """Locks down the current channel or a specified channel."""
+    await interaction.response.defer(ephemeral=True)
+    target_channel = channel or interaction.channel
+
+    current_overwrites = target_channel.overwrites_for(interaction.guild.default_role)
+    if current_overwrites.send_messages is False:
+        await interaction.followup.send(f"{target_channel.mention} is already locked down.", ephemeral=True)
+        return
+
+    try:
+        await target_channel.set_permissions(interaction.guild.default_role, send_messages=False)
+        await target_channel.send(f"🔒 This channel has been locked down by {interaction.user.mention}. Only staff can send messages.")
+        await interaction.followup.send(f"Successfully locked down {target_channel.mention}.", ephemeral=True)
+        print(f"Locked down #{target_channel.name} by {interaction.user.display_name}.")
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I do not have permission to manage channels. Please ensure I have 'Manage Channels' permission and my role is higher than `@everyone`.",
+            ephemeral=True
+        )
+        print(f"ERROR: Bot lacks 'Manage Channels' permission to lockdown #{target_channel.name}.")
+    except Exception as e:
+        await interaction.followup.send(f"An unexpected error occurred: {e}", ephemeral=True)
+        print(f"ERROR locking down #{target_channel.name}: {e}")
+
+@lockdown.error
+async def lockdown_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("You must be the bot owner to use this command.", ephemeral=True)
+    elif isinstance(error, app_commands.BadArgument):
+        await interaction.response.send_message("Invalid channel provided. Please mention a valid text channel.", ephemeral=True)
+    else:
+        if interaction.response.is_done():
+            await interaction.followup.send(f"An unexpected error occurred: {error}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"An unexpected error occurred: {error}", ephemeral=True)
+
+# --- Unlock Command ---
+@bot.tree.command(name='unlock', description='(Owner Only) Unlocks the current channel or a specified channel.')
+@app_commands.describe(channel='The channel to unlock (defaults to current channel).')
+@app_commands.check(is_bot_owner_slash)
+async def unlock(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    """Unlocks the current channel or a specified channel."""
+    await interaction.response.defer(ephemeral=True)
+    target_channel = channel or interaction.channel
+
+    current_overwrites = target_channel.overwrites_for(interaction.guild.default_role)
+    if current_overwrites.send_messages is not False: # If it's not explicitly denied
+        await interaction.followup.send(f"{target_channel.mention} is not currently locked down.", ephemeral=True)
+        return
+
+    try:
+        # Setting send_messages to None removes the explicit overwrite, reverting to category/default
+        await target_channel.set_permissions(interaction.guild.default_role, send_messages=None)
+        await target_channel.send(f"🔓 This channel has been unlocked by {interaction.user.mention}. Members can now send messages.")
+        await interaction.followup.send(f"Successfully unlocked {target_channel.mention}.", ephemeral=True)
+        print(f"Unlocked #{target_channel.name} by {interaction.user.display_name}.")
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I do not have permission to manage channels. Please ensure I have 'Manage Channels' permission and my role is higher than `@everyone`.",
+            ephemeral=True
+        )
+        print(f"ERROR: Bot lacks 'Manage Channels' permission to unlock #{target_channel.name}.")
+    except Exception as e:
+        await interaction.followup.send(f"An unexpected error occurred: {e}", ephemeral=True)
+        print(f"ERROR unlocking #{target_channel.name}: {e}")
+
+@unlock.error
+async def unlock_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("You must be the bot owner to use this command.", ephemeral=True)
+    elif isinstance(error, app_commands.BadArgument):
+        await interaction.response.send_message("Invalid channel provided. Please mention a valid text channel.", ephemeral=True)
+    else:
+        if interaction.response.is_done():
+            await interaction.followup.send(f"An unexpected error occurred: {error}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"An unexpected error occurred: {error}", ephemeral=True)
+
+# This bot.py file is designed to be run via main.py, which starts the bot.
+# The `if __name__ == '__main__':` block is removed as main.py handles execution.
 bot.run(TOKEN)
